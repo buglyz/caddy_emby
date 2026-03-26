@@ -112,6 +112,128 @@ def html_escape(value):
 
 def run_command(command):
     return subprocess.run(command, capture_output=True, text=True, check=False)
+
+def route(path, lang, extra=None):
+    query = {"lang": get_lang(lang)}
+    if extra:
+        query.update(extra)
+    return f"{normalize_base_path()}{path}?{urlencode(query)}"
+
+def validate_site(form, lang, original_domain=""):
+    domain = form.get("domain", "").strip()
+    upstream = form.get("upstream", "").strip()
+    certificate_mode = form.get("certificate_mode", "auto").strip() or "auto"
+    custom_cert_path = form.get("custom_cert_path", "").strip()
+    custom_key_path = form.get("custom_key_path", "").strip()
+    acme_email = form.get("acme_email", "").strip()
+    notes = form.get("notes", "").strip()
+    skip_tls_verify = parse_bool(form.get("skip_tls_verify", ""))
+    if not domain:
+        raise ValueError(tr(lang, "e_domain_req"))
+    if " " in domain or "/" in domain:
+        raise ValueError(tr(lang, "e_domain_fmt"))
+    if not upstream:
+        raise ValueError(tr(lang, "e_upstream_req"))
+    if certificate_mode not in {"auto", "internal", "custom"}:
+        raise ValueError(tr(lang, "e_mode"))
+    if certificate_mode == "custom" and (not custom_cert_path or not custom_key_path):
+        raise ValueError(tr(lang, "e_custom"))
+    if skip_tls_verify and not upstream.startswith("https://"):
+        raise ValueError(tr(lang, "e_skip"))
+    state = load_state()
+    for site in state["sites"]:
+        existing = str(site.get("domain", "")).lower()
+        if existing == domain.lower() and existing != original_domain.lower():
+            raise ValueError(tr(lang, "e_exists", domain=domain))
+    return SiteConfig(domain, upstream, certificate_mode, custom_cert_path, custom_key_path, acme_email, skip_tls_verify, notes)
+
+def site_to_caddy_block(site):
+    domain = str(site["domain"])
+    upstream = str(site["upstream"])
+    mode = str(site.get("certificate_mode", "auto"))
+    custom_cert = str(site.get("custom_cert_path", ""))
+    custom_key = str(site.get("custom_key_path", ""))
+    skip_tls_verify = bool(site.get("skip_tls_verify", False))
+    lines = [f"{domain} {{", "    encode gzip", "    header Access-Control-Allow-Origin *"]
+    if mode == "internal":
+        lines.append("    tls internal")
+    elif mode == "custom":
+        lines.append(f"    tls {custom_cert} {custom_key}")
+    lines.append(f"    reverse_proxy {upstream} {{")
+    if upstream.startswith("https://"):
+        lines.append("        transport http {")
+        if skip_tls_verify:
+            lines.append("            tls_insecure_skip_verify")
+        lines.append("        }")
+    lines.extend([
+        "        header_up X-Real-IP {remote_host}",
+        "        header_up X-Forwarded-For {remote_host}",
+        "        header_up X-Forwarded-Proto {scheme}",
+        "        header_up Host {upstream_hostport}",
+        "    }",
+        "}",
+    ])
+    return "\n".join(lines)
+
+def render_caddyfile(state):
+    emails = sorted({str(site.get("acme_email", "")).strip() for site in state["sites"] if str(site.get("acme_email", "")).strip()})
+    blocks = []
+    if emails:
+        blocks.append("{\n    email " + emails[0] + "\n}")
+    blocks.extend(site_to_caddy_block(site) for site in sorted(state["sites"], key=lambda item: str(item["domain"]).lower()))
+    return ("\n\n".join(blocks).strip() + "\n") if blocks else ""
+
+def apply_caddy_config(state, lang):
+    CADDYFILE_PATH.parent.mkdir(parents=True, exist_ok=True)
+    content = render_caddyfile(state) or "# managed by caddy-emby-ui\n"
+    with tempfile.NamedTemporaryFile("w", encoding="utf-8", delete=False, suffix=".caddy") as handle:
+        handle.write(content)
+        temp_path = Path(handle.name)
+    try:
+        validate = run_command(["caddy", "validate", "--config", str(temp_path)])
+        if validate.returncode != 0:
+            raise RuntimeError((validate.stderr or validate.stdout).strip() or tr(lang, "e_validate"))
+        CADDYFILE_PATH.write_text(content, encoding="utf-8")
+        reload_result = run_command(["systemctl", "reload", "caddy"])
+        if reload_result.returncode != 0:
+            restart = run_command(["systemctl", "restart", "caddy"])
+            if restart.returncode != 0:
+                raise RuntimeError((restart.stderr or restart.stdout).strip() or tr(lang, "e_restart"))
+        return tr(lang, "updated")
+    finally:
+        temp_path.unlink(missing_ok=True)
+
+def get_service_status():
+    active = run_command(["systemctl", "is-active", "caddy"])
+    version = run_command(["caddy", "version"])
+    return {
+        "caddy_status": (active.stdout or active.stderr).strip() or "unknown",
+        "caddy_version": (version.stdout or version.stderr).strip() or "unknown",
+        "managed_sites": str(len(load_state()["sites"])),
+    }
+
+def cert_label(mode, lang):
+    return {"auto": tr(lang, "cert_auto"), "internal": tr(lang, "cert_internal"), "custom": tr(lang, "cert_custom")}.get(mode, mode)
+
+def require_auth(handler):
+    if not UI_USERNAME or not UI_PASSWORD:
+        return True
+    header = handler.headers.get("Authorization", "")
+    if not header.startswith("Basic "):
+        handler.send_response(HTTPStatus.UNAUTHORIZED)
+        handler.send_header("WWW-Authenticate", 'Basic realm="Caddy Emby UI"')
+        handler.end_headers()
+        return False
+    try:
+        decoded = base64.b64decode(header.split(" ", 1)[1].strip()).decode("utf-8")
+    except Exception:
+        handler.send_error(HTTPStatus.UNAUTHORIZED)
+        return False
+    username, _, password = decoded.partition(":")
+    if not (secrets.compare_digest(username, UI_USERNAME) and secrets.compare_digest(password, UI_PASSWORD)):
+        handler.send_error(HTTPStatus.UNAUTHORIZED)
+        return False
+    return True
 def language_switch(lang):
     return f'<div class="lang-switch"><a class="button secondary" href="{route("/", "zh-CN")}">{html_escape(tr("zh-CN", "lang_zh"))}</a><a class="button secondary" href="{route("/", "en")}">{html_escape(tr("en", "lang_en"))}</a></div>'
 
