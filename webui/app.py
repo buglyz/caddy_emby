@@ -192,7 +192,7 @@ def apply_caddy_config(state, lang):
         handle.write(content)
         temp_path = Path(handle.name)
     try:
-        validate = run_command(["caddy", "validate", "--config", str(temp_path)])
+        validate = run_command(["caddy", "validate", "--config", str(temp_path), "--adapter", "caddyfile"])
         if validate.returncode != 0:
             raise RuntimeError((validate.stderr or validate.stdout).strip() or tr(lang, "e_validate"))
         CADDYFILE_PATH.write_text(content, encoding="utf-8")
