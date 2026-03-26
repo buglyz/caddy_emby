@@ -1,5 +1,10 @@
 # Caddy Emby Manager
 
+语言版本：
+
+- English: `README.md`
+- 中文: `README.zh-CN.md`
+
 一个面向 Debian 和 Ubuntu 服务器的 Emby + Caddy 管理工具。
 
 当前仓库包含两个入口：

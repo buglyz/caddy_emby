@@ -1,5 +1,10 @@
 # Caddy Emby Manager
 
+Language:
+
+- English: `README.md`
+- 中文: `README.zh-CN.md`
+
 A Debian and Ubuntu focused management tool for running Emby behind Caddy.
 
 This repository currently includes two entry points:
