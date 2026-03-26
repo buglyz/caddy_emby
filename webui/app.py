@@ -68,6 +68,7 @@ class SiteConfig:
     acme_email: str = ""
     skip_tls_verify: bool = False
     notes: str = ""
+    base_path: str = ""
 
 
 def get_lang(requested=""):
@@ -127,6 +128,7 @@ def validate_site(form, lang, original_domain=""):
     custom_key_path = form.get("custom_key_path", "").strip()
     acme_email = form.get("acme_email", "").strip()
     notes = form.get("notes", "").strip()
+    base_path = form.get("base_path", "").strip()
     skip_tls_verify = parse_bool(form.get("skip_tls_verify", ""))
     if not domain:
         raise ValueError(tr(lang, "e_domain_req"))
@@ -145,7 +147,7 @@ def validate_site(form, lang, original_domain=""):
         existing = str(site.get("domain", "")).lower()
         if existing == domain.lower() and existing != original_domain.lower():
             raise ValueError(tr(lang, "e_exists", domain=domain))
-    return SiteConfig(domain, upstream, certificate_mode, custom_cert_path, custom_key_path, acme_email, skip_tls_verify, notes)
+    return SiteConfig(domain, upstream, certificate_mode, custom_cert_path, custom_key_path, acme_email, skip_tls_verify, notes, base_path)
 
 def site_to_caddy_block(site):
     domain = str(site["domain"])
@@ -203,6 +205,30 @@ def apply_caddy_config(state, lang):
     finally:
         temp_path.unlink(missing_ok=True)
 
+def probe_upstream(upstream: str, timeout: float = 3.0) -> str:
+    """Best-effort HTTP probe for the configured upstream.
+
+    Notes:
+    - This runs on the WebUI host, *not* from Caddy itself.
+    - It only does a lightweight request and is safe to ignore if it fails.
+    """
+    try:
+        import urllib.request
+        import urllib.error
+
+        # Normalise bare host:port into http://host:port for probing
+        url = upstream.strip()
+        if not url.startswith(("http://", "https://")):
+            url = f"http://{url}"
+
+        req = urllib.request.Request(url, method="GET")
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            code = getattr(resp, "status", getattr(resp, "code", 0))
+            return f"OK (HTTP {code})"
+    except Exception as exc:  # pragma: no cover - best-effort diagnostics
+        return f"unreachable: {exc.__class__.__name__}"
+
+
 def get_service_status():
     active = run_command(["systemctl", "is-active", "caddy"])
     version = run_command(["caddy", "version"])
@@ -243,22 +269,24 @@ def layout(title, content, lang):
 
 def render_dashboard(message="", message_type="success", form=None, edit_domain="", lang="en"):
     state = load_state(); status = get_service_status(); current = next((site for site in state["sites"] if str(site.get("domain")) == edit_domain), None) if edit_domain else None
-    values = {"domain":"","upstream":"127.0.0.1:8096","certificate_mode":"auto","custom_cert_path":"","custom_key_path":"","acme_email":DEFAULT_EMAIL,"skip_tls_verify":"","notes":""}
+    values = {"domain":"","upstream":"127.0.0.1:8096","certificate_mode":"auto","custom_cert_path":"","custom_key_path":"","acme_email":DEFAULT_EMAIL,"skip_tls_verify":"","notes":"","base_path":""}
     if current:
-        values.update({k: str(v) for k, v in current.items() if k in values}); values["skip_tls_verify"] = "1" if current.get("skip_tls_verify") else ""
+        values.update({k: str(v) for k, v in current.items() if k in values}); values["skip_tls_verify"] = "1" if current.get("skip_tls_verify") else ""; values["base_path"] = str(current.get("base_path", ""))
     if form:
         values.update(form)
     flash = f'<div class="flash {message_type}">{html_escape(message)}</div>' if message else ""
     rows = []
     for site in sorted(state["sites"], key=lambda item: str(item["domain"]).lower()):
         domain = str(site["domain"])
-        rows.append(f'''<tr><td><div class="domain">{html_escape(domain)}</div><div class="hint">{html_escape(str(site.get("notes", "")) or tr(lang, "no_notes"))}</div></td><td class="mono">{html_escape(site.get("upstream", ""))}</td><td>{html_escape(cert_label(str(site.get("certificate_mode", "auto")), lang))}</td><td><div class="actions"><a class="button secondary" href="{route("/", lang, {"edit": domain})}">{html_escape(tr(lang, "edit"))}</a><form method="post" action="{route("/delete", lang)}" onsubmit="return confirm('{html_escape(tr(lang, "delete_q", domain=domain))}');"><input type="hidden" name="domain" value="{html_escape(domain)}"><button class="danger" type="submit">{html_escape(tr(lang, "delete"))}</button></form></div></td></tr>''')
+        upstream = str(site.get("upstream", ""))
+        health = probe_upstream(upstream) if upstream else "-"
+        rows.append(f'''<tr><td><div class="domain">{html_escape(domain)}</div><div class="hint">{html_escape(str(site.get("notes", "")) or tr(lang, "no_notes"))}</div></td><td class="mono">{html_escape(upstream)}<div class="hint">{html_escape(health)}</div></td><td>{html_escape(cert_label(str(site.get("certificate_mode", "auto")), lang))}</td><td><div class="actions"><a class="button secondary" href="{route("/", lang, {"edit": domain})}">{html_escape(tr(lang, "edit"))}</a><form method="post" action="{route("/delete", lang)}" onsubmit="return confirm('{html_escape(tr(lang, "delete_q", domain=domain))}');"><input type="hidden" name="domain" value="{html_escape(domain)}"><button class="danger" type="submit">{html_escape(tr(lang, "delete"))}</button></form></div></td></tr>''')
     if rows:
         table = f'''<table><thead><tr><th>{html_escape(tr(lang, "domain"))}</th><th>{html_escape(tr(lang, "upstream"))}</th><th>{html_escape(tr(lang, "cert_mode"))}</th><th>{html_escape(tr(lang, "actions"))}</th></tr></thead><tbody>{"".join(rows)}</tbody></table>'''
     else:
         table = f'<div class="empty">{html_escape(tr(lang, "empty"))}</div>'
     desc = tr(lang, "sites_desc", local=f'<span class="mono">127.0.0.1:8096</span>', remote=f'<span class="mono">https://remote.example.com:443</span>')
-    content = f'''<div class="grid"><section class="card"><div class="card-header"><h2>{html_escape(tr(lang, "sites"))}</h2><p>{desc}</p></div><div class="card-body">{flash}<div class="status-grid"><div class="pill"><strong>{html_escape(tr(lang, "status"))}</strong>{html_escape(status["caddy_status"])}</div><div class="pill"><strong>{html_escape(tr(lang, "version"))}</strong>{html_escape(status["caddy_version"])}</div><div class="pill"><strong>{html_escape(tr(lang, "managed"))}</strong>{html_escape(status["managed_sites"])}</div></div><div class="toolbar"><form method="post" action="{route("/reload", lang)}"><button type="submit">{html_escape(tr(lang, "reload"))}</button></form><a class="button secondary" href="{route("/config", lang)}">{html_escape(tr(lang, "view_cfg"))}</a></div><div style="margin-top:18px">{table}</div></div></section><section class="card"><div class="card-header"><h2>{html_escape(tr(lang, "edit_site") if edit_domain else tr(lang, "add_site"))}</h2><p>{html_escape(tr(lang, "form_desc"))}</p></div><div class="card-body"><form method="post" action="{route("/save", lang)}" class="stack"><input type="hidden" name="original_domain" value="{html_escape(edit_domain)}"><label><span>{html_escape(tr(lang, "domain"))}</span><input name="domain" required value="{html_escape(values['domain'])}" placeholder="emby.example.com"></label><label><span>{html_escape(tr(lang, "upstream"))}</span><input name="upstream" required value="{html_escape(values['upstream'])}" placeholder="127.0.0.1:8096 or https://remote.example.com:443"></label><label><span>{html_escape(tr(lang, "cert_mode"))}</span><select name="certificate_mode"><option value="auto" {"selected" if values['certificate_mode']=='auto' else ""}>{html_escape(tr(lang, "cert_auto"))}</option><option value="internal" {"selected" if values['certificate_mode']=='internal' else ""}>{html_escape(tr(lang, "cert_internal"))}</option><option value="custom" {"selected" if values['certificate_mode']=='custom' else ""}>{html_escape(tr(lang, "cert_custom"))}</option></select></label><label><span>{html_escape(tr(lang, "acme"))}</span><input name="acme_email" value="{html_escape(values['acme_email'])}" placeholder="{html_escape(tr(lang, "acme_ph"))}"></label><label><span>{html_escape(tr(lang, "cert_path"))}</span><input name="custom_cert_path" value="{html_escape(values['custom_cert_path'])}" placeholder="/etc/ssl/emby/fullchain.pem"></label><label><span>{html_escape(tr(lang, "key_path"))}</span><input name="custom_key_path" value="{html_escape(values['custom_key_path'])}" placeholder="/etc/ssl/emby/privkey.pem"></label><label class="check"><input type="checkbox" name="skip_tls_verify" value="1" {"checked" if values['skip_tls_verify'] else ""}><span>{html_escape(tr(lang, "skip_tls"))}</span></label><label><span>{html_escape(tr(lang, "notes"))}</span><textarea name="notes" placeholder="{html_escape(tr(lang, "notes_ph"))}">{html_escape(values['notes'])}</textarea></label><div class="actions"><button type="submit">{html_escape(tr(lang, "save") if edit_domain else tr(lang, "add"))}</button><a class="button secondary" href="{route("/", lang)}">{html_escape(tr(lang, "clear"))}</a></div></form></div></section></div>'''
+    content = f'''<div class="grid"><section class="card"><div class="card-header"><h2>{html_escape(tr(lang, "sites"))}</h2><p>{desc}</p></div><div class="card-body">{flash}<div class="status-grid"><div class="pill"><strong>{html_escape(tr(lang, "status"))}</strong>{html_escape(status["caddy_status"])}</div><div class="pill"><strong>{html_escape(tr(lang, "version"))}</strong>{html_escape(status["caddy_version"])}</div><div class="pill"><strong>{html_escape(tr(lang, "managed"))}</strong>{html_escape(status["managed_sites"])}</div></div><div class="toolbar"><form method="post" action="{route("/reload", lang)}"><button type="submit">{html_escape(tr(lang, "reload"))}</button></form><a class="button secondary" href="{route("/config", lang)}">{html_escape(tr(lang, "view_cfg"))}</a></div><div style="margin-top:18px">{table}</div></div></section><section class="card"><div class="card-header"><h2>{html_escape(tr(lang, "edit_site") if edit_domain else tr(lang, "add_site"))}</h2><p>{html_escape(tr(lang, "form_desc"))}</p></div><div class="card-body"><form method="post" action="{route("/save", lang)}" class="stack"><input type="hidden" name="original_domain" value="{html_escape(edit_domain)}"><label><span>{html_escape(tr(lang, "domain"))}</span><input name="domain" required value="{html_escape(values['domain'])}" placeholder="emby.example.com"></label><label><span>{html_escape(tr(lang, "upstream"))}</span><input name="upstream" required value="{html_escape(values['upstream'])}" placeholder="127.0.0.1:8096 or https://remote.example.com:443"></label><label><span>子路径 / Base path (可选)</span><input name="base_path" value="{html_escape(values['base_path'])}" placeholder="/emby01"></label><label><span>{html_escape(tr(lang, "cert_mode"))}</span><select name="certificate_mode"><option value="auto" {"selected" if values['certificate_mode']=='auto' else ""}>{html_escape(tr(lang, "cert_auto"))}</option><option value="internal" {"selected" if values['certificate_mode']=='internal' else ""}>{html_escape(tr(lang, "cert_internal"))}</option><option value="custom" {"selected" if values['certificate_mode']=='custom' else ""}>{html_escape(tr(lang, "cert_custom"))}</option></select></label><label><span>{html_escape(tr(lang, "acme"))}</span><input name="acme_email" value="{html_escape(values['acme_email'])}" placeholder="{html_escape(tr(lang, "acme_ph"))}"></label><label><span>{html_escape(tr(lang, "cert_path"))}</span><input name="custom_cert_path" value="{html_escape(values['custom_cert_path'])}" placeholder="/etc/ssl/emby/fullchain.pem"></label><label><span>{html_escape(tr(lang, "key_path"))}</span><input name="custom_key_path" value="{html_escape(values['custom_key_path'])}" placeholder="/etc/ssl/emby/privkey.pem"></label><label class="check"><input type="checkbox" name="skip_tls_verify" value="1" {"checked" if values['skip_tls_verify'] else ""}><span>{html_escape(tr(lang, "skip_tls"))}</span></label><label><span>{html_escape(tr(lang, "notes"))}</span><textarea name="notes" placeholder="{html_escape(tr(lang, "notes_ph"))}">{html_escape(values['notes'])}</textarea></label><div class="actions"><button type="submit">{html_escape(tr(lang, "save") if edit_domain else tr(lang, "add"))}</button><a class="button secondary" href="{route("/", lang)}">{html_escape(tr(lang, "clear"))}</a></div></form></div></section></div>'''
     return layout(tr(lang, "title"), content, lang)
 
 class AppHandler(BaseHTTPRequestHandler):
