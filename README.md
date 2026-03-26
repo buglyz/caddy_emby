@@ -3,7 +3,7 @@
 Language:
 
 - English: `README.md`
-- 中文: `README.zh-CN.md`
+- 中文: [README.zh-CN.md](README.zh-CN.md)
 
 A Debian and Ubuntu focused management tool for running Emby behind Caddy.
 
